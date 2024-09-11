@@ -1,29 +1,28 @@
 import os
 import random
 import sys
-import win32com.client as client
-import win32gui
 import time
-
 import cv2
 import numpy as np
 import pyautogui
-
+import win32gui
+import win32com.client as client
 from PyQt5.QtWidgets import QApplication
 
+# 创建 SIFT 对象和 Shell 对象
 SIFT = cv2.SIFT_create()
 shell = client.Dispatch('WScript.Shell')
 
 
 def get_app_shot(hwnd):
+    """获取指定窗口的截图并转换为 numpy 数组。"""
     left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-    app = QApplication(sys.argv)
+    app = QApplication.instance() or QApplication(sys.argv)
     screen = QApplication.primaryScreen()
     image = screen.grabWindow(hwnd).toImage()
 
-    # QImage to numpy array
-    width = image.width()
-    height = image.height()
+    # QImage 转换为 numpy 数组
+    width, height = image.width(), image.height()
     buf = image.bits()
     buf.setsize(height * width * 4)
     arr = np.frombuffer(buf, np.uint8).reshape((height, width, 4))
@@ -31,113 +30,114 @@ def get_app_shot(hwnd):
     return cv2.cvtColor(arr, cv2.COLOR_BGR2BGRA), left, top
 
 
-def compute_app_shot(screen):
-    kp, des = SIFT.detectAndCompute(screen, None)
-    return kp, des
+def compute_keypoints_descriptors(image):
+    """计算图像的关键点和描述符。"""
+    return SIFT.detectAndCompute(image, None)
 
 
-def location(image, kp, des):
-    kp2, des2 = SIFT.detectAndCompute(image, None)
+def locate_image(target_image, kp_des_screen):
+    """在屏幕截图中查找目标图像的位置。"""
+    kp_screen, des_screen = kp_des_screen
+    kp_target, des_target = SIFT.detectAndCompute(target_image, None)
 
+    if des_screen is None or des_target is None:
+        return None
+
+    # 使用 FLANN 匹配器进行匹配
     flann = cv2.FlannBasedMatcher()
-    matches = flann.knnMatch(des2, des, k=2)
+    matches = flann.knnMatch(des_target, des_screen, k=2)
 
-    good = [m for m, n in matches if m.distance < 0.75 * n.distance]
+    # 使用比率测试来找到好的匹配点
+    good_matches = [m for m, n in matches if m.distance < 0.75 * n.distance]
 
-    if len(good) > 45:
-        src_pts = np.float32([kp2[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-        dst_pts = np.float32([kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    if len(good_matches) > 45:
+        src_pts = np.float32([kp_target[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp_screen[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
         mm, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-        mask.ravel().tolist()
 
         if mm is not None:
-            h, w = image.shape[:2]
+            h, w = target_image.shape[:2]
             pts = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
             dst = cv2.perspectiveTransform(pts, mm)
-            mid_pos_arr = dst[0] + (dst[2] - dst[0]) // 2
-            mid_pos = (mid_pos_arr[0][0], mid_pos_arr[0][1])
+            mid_pos = tuple(np.mean([dst[0][0], dst[2][0]], axis=0))
             return mid_pos
 
     return None
 
 
-def click(pos, left, top):
+def click_position(pos, left, top):
+    """在指定位置点击，并添加随机偏移和延迟。"""
+    x_offset, y_offset = random.randint(-9, 9), random.randint(-9, 9)
+    new_pos = (pos[0] + left + x_offset, pos[1] + top + y_offset + 10)
 
-    # 随机偏移量
-    factor = random.randint(0, 9)
+    # 根据距离计算移动时间
+    current_pos = pyautogui.position()
+    distance = np.linalg.norm(np.array(new_pos) - np.array(current_pos))
+    duration = distance * random.uniform(0.8, 1.2) / 2048
 
-    # 随机偏移坐标
-    x, y = random.randint(-factor, factor), random.randint(-factor, factor)
-
-    # UI 的特殊性向下偏移 10px
-    new_pos = (pos[0] + left + x, pos[1] + top + y + 10)
-
-    # 随机移动速度
-    duration = random.uniform(0.4, 0.9)
-    pyautogui.moveTo(new_pos, duration=duration)
+    pyautogui.moveTo(new_pos, duration=duration, tween=pyautogui.easeInOutQuad)
     pyautogui.click()
 
-    if factor % 2 == 0:
-        # 不固定的第二次点击间隔
+    # 随机触发第二次点击
+    if random.randint(0, 9) % 2 == 0:
         time.sleep(random.uniform(0.3, 0.8))
         pyautogui.click()
 
-    # 响应等待
     time.sleep(random.uniform(0.5, 1.0))
 
 
-def automatic(arg):
-    hwnd = None
-    hwnd0 = win32gui.FindWindow('Win32Window', '阴阳师-网易游戏')
-    hwnd1 = win32gui.FindWindowEx(0, hwnd0, 'Win32Window', '阴阳师-网易游戏')
+def automatic_clicks(cycles, delay, target_files):
+    """自动化点击循环，根据指定的次数和延迟进行操作。"""
+    hwnd0 = win32gui.FindWindow('Win32Window', '游戏窗口名')
+    hwnd1 = win32gui.FindWindowEx(0, hwnd0, 'Win32Window', '游戏窗口名')
 
     if hwnd0 == 0:
         print('未找到游戏窗口，退出。')
         return
-    elif hwnd1 == 0:
-        print('未找到第二个游戏窗口，单人模式...')
 
-    i = 0
-    while i < arg:
-        if hwnd is None:
-            hwnd = hwnd0
-        elif hwnd1 != 0 and hwnd is hwnd0:
-            hwnd = hwnd1
-        else:
-            hwnd = hwnd0
-
+    hwnd = hwnd0
+    for i in range(cycles):
         screen, left, top = get_app_shot(hwnd)
-        window_shape = screen.shape
-        kp, des = compute_app_shot(screen)
+        kp_des_screen = compute_keypoints_descriptors(screen)
 
-        for _, image in files.items():
-            pos = location(image, kp, des)
-            if pos is not None:
+        for image_name, image in target_files.items():
+            pos = locate_image(image, kp_des_screen)
+            if pos:
                 shell.SendKeys('%')
                 win32gui.SetForegroundWindow(hwnd)
-                click(pos, left, top)
-                if _ == "1" and hwnd is hwnd0:
-                    i += 1
-                    print(f'第 {i:03d} 次挑战')
+                click_position(pos, left, top)
 
-                break
+                if image_name == "1" and hwnd == hwnd0:
+                    print(f'第 {i + 1:03d} 次挑战')
+                    time.sleep(delay)
+                    break
+
+        hwnd = hwnd1 if hwnd == hwnd0 and hwnd1 != 0 else hwnd0
 
 
 if __name__ == '__main__':
     try:
         times = int(input('输入循环次数：'))
+        waiting_time = int(input('输入循环间隔（秒）：'))
+        script_path = os.path.abspath(sys.argv[0])
+        resource_folder = os.path.join(os.path.dirname(script_path), "images")
+
+        # 加载资源文件夹中的图片
         files = {}
-        script_path = sys.argv[0]
-        script_dir = os.path.dirname(script_path)
-        resource_folder = os.path.join(script_dir, "images")
-        file_list = os.listdir(resource_folder)
+        for image_file in os.listdir(resource_folder):
+            if image_file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                file_path = os.path.join(resource_folder, image_file)
+                image_name = os.path.splitext(image_file)[0]
+                image = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
 
-        for image_file in file_list:
-            ifile = os.path.join(resource_folder, image_file)
-            name = image_file.split('.')[0]
-            bgr = cv2.imread(ifile, cv2.COLOR_BGR2BGRA)
-            files[name] = bgr
+                if image is not None:
+                    files[image_name] = image
+                else:
+                    print(f"无法加载图像：{file_path}")
 
-        automatic(times)
+        automatic_clicks(times, waiting_time, files)
+
     except ValueError:
         print('输入异常，请重试...')
+    except Exception as e:
+        print(f"程序遇到错误：{e}")
