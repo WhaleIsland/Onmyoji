@@ -4,5 +4,6 @@
 /venv/
 /build/
 /dist/
+/target/
 
 *.spec

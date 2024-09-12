@@ -1,28 +1,41 @@
+import msvcrt
 import os
 import random
 import sys
+import win32com.client as client
+import win32gui
 import time
 import cv2
 import numpy as np
 import pyautogui
-import win32gui
-import win32com.client as client
+
 from PyQt5.QtWidgets import QApplication
 
-# 创建 SIFT 对象和 Shell 对象
 SIFT = cv2.SIFT_create()
 shell = client.Dispatch('WScript.Shell')
 
 
+def resource_path(relative_path):
+    """获取资源文件的绝对路径（适用于打包后的环境）。"""
+    if getattr(sys, 'frozen', False):
+        # 如果程序是通过 PyInstaller 打包的
+        base_path = os.path.dirname(sys.executable)
+    else:
+        # 如果程序是直接运行的源代码
+        base_path = os.path.dirname(__file__)
+
+    return os.path.join(base_path, relative_path)
+
+
 def get_app_shot(hwnd):
-    """获取指定窗口的截图并转换为 numpy 数组。"""
     left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-    app = QApplication.instance() or QApplication(sys.argv)
+    app = QApplication(sys.argv)
     screen = QApplication.primaryScreen()
     image = screen.grabWindow(hwnd).toImage()
 
-    # QImage 转换为 numpy 数组
-    width, height = image.width(), image.height()
+    # QImage to numpy array
+    width = image.width()
+    height = image.height()
     buf = image.bits()
     buf.setsize(height * width * 4)
     arr = np.frombuffer(buf, np.uint8).reshape((height, width, 4))
@@ -30,36 +43,31 @@ def get_app_shot(hwnd):
     return cv2.cvtColor(arr, cv2.COLOR_BGR2BGRA), left, top
 
 
-def compute_keypoints_descriptors(image):
-    """计算图像的关键点和描述符。"""
-    return SIFT.detectAndCompute(image, None)
+def compute_app_shot(screen):
+    kp, des = SIFT.detectAndCompute(screen, None)
+    return kp, des
 
 
-def locate_image(target_image, kp_des_screen):
-    """在屏幕截图中查找目标图像的位置。"""
-    kp_screen, des_screen = kp_des_screen
-    kp_target, des_target = SIFT.detectAndCompute(target_image, None)
+def location(image, kp, des):
+    kp2, des2 = SIFT.detectAndCompute(image, None)
 
-    if des_screen is None or des_target is None:
-        return None
-
-    # 使用 FLANN 匹配器进行匹配
     flann = cv2.FlannBasedMatcher()
-    matches = flann.knnMatch(des_target, des_screen, k=2)
+    matches = flann.knnMatch(des2, des, k=2)
 
-    # 使用比率测试来找到好的匹配点
-    good_matches = [m for m, n in matches if m.distance < 0.75 * n.distance]
+    good = [m for m, n in matches if m.distance < 0.75 * n.distance]
 
-    if len(good_matches) > 45:
-        src_pts = np.float32([kp_target[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-        dst_pts = np.float32([kp_screen[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    if len(good) > 45:
+        src_pts = np.float32([kp2[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
         mm, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        mask.ravel().tolist()
 
         if mm is not None:
-            h, w = target_image.shape[:2]
+            h, w = image.shape[:2]
             pts = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
             dst = cv2.perspectiveTransform(pts, mm)
-            mid_pos = tuple(np.mean([dst[0][0], dst[2][0]], axis=0))
+            mid_pos_arr = dst[0] + (dst[2] - dst[0]) // 2
+            mid_pos = (mid_pos_arr[0][0], mid_pos_arr[0][1])
             return mid_pos
 
     return None
@@ -86,58 +94,76 @@ def click_position(pos, left, top):
     time.sleep(random.uniform(0.5, 1.0))
 
 
-def automatic_clicks(cycles, delay, target_files):
-    """自动化点击循环，根据指定的次数和延迟进行操作。"""
-    hwnd0 = win32gui.FindWindow('Win32Window', '游戏窗口名')
-    hwnd1 = win32gui.FindWindowEx(0, hwnd0, 'Win32Window', '游戏窗口名')
+def find_multiple_windows(title):
+    """查找所有匹配指定标题的窗口句柄。"""
+    hwnd_list = []
 
-    if hwnd0 == 0:
-        print('未找到游戏窗口，退出。')
+    def callback(hwnd, _):
+        if win32gui.IsWindowVisible(hwnd) and title in win32gui.GetWindowText(hwnd):
+            hwnd_list.append(hwnd)
+
+    win32gui.EnumWindows(callback, None)
+    return hwnd_list
+
+
+def automatic(times, delay):
+    """自动化点击循环，在多个窗口之间切换操作。"""
+    hwnds = find_multiple_windows('游戏窗口名')
+
+    if not hwnds:
+        print('未找到游戏窗口，退出...')
+        time.sleep(5)
         return
 
-    hwnd = hwnd0
-    for i in range(cycles):
-        screen, left, top = get_app_shot(hwnd)
-        kp_des_screen = compute_keypoints_descriptors(screen)
+    current_window_index = 0
+    i = 1
+    while i < times:
+        start_time = time.time()
 
-        for image_name, image in target_files.items():
-            pos = locate_image(image, kp_des_screen)
-            if pos:
-                shell.SendKeys('%')
-                win32gui.SetForegroundWindow(hwnd)
-                click_position(pos, left, top)
+        while time.time() - start_time < 30:
+            hwnd = hwnds[current_window_index]
+            screen, left, top = get_app_shot(hwnd)
+            window_shape = screen.shape
+            kp, des = compute_app_shot(screen)
 
-                if image_name == "1" and hwnd == hwnd0:
-                    print(f'第 {i + 1:03d} 次挑战')
-                    time.sleep(delay)
+            for _, image in files.items():
+                pos = location(image, kp, des)
+                if pos is not None:
+                    start_time = time.time()
+                    shell.SendKeys('%')
+                    win32gui.SetForegroundWindow(hwnd)
+                    click_position(pos, left, top)
+                    if _ == "1" and hwnd is hwnds[0]:
+                        print(f'第 {i + 1:03d} 次挑战')
+                        i += 1
+                        time.sleep(delay)
                     break
 
-        hwnd = hwnd1 if hwnd == hwnd0 and hwnd1 != 0 else hwnd0
+            # 切换到下一个窗口
+            current_window_index = (current_window_index + 1) % len(hwnds)
+        else:
+            print(f"第 {i:03d} 次未找到目标图像，退出。")
+            return
 
 
 if __name__ == '__main__':
     try:
         times = int(input('输入循环次数：'))
         waiting_time = int(input('输入循环间隔（秒）：'))
-        script_path = os.path.abspath(sys.argv[0])
-        resource_folder = os.path.join(os.path.dirname(script_path), "images")
-
-        # 加载资源文件夹中的图片
         files = {}
-        for image_file in os.listdir(resource_folder):
-            if image_file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                file_path = os.path.join(resource_folder, image_file)
-                image_name = os.path.splitext(image_file)[0]
-                image = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+        resource_folder = resource_path("images")
+        file_list = os.listdir(resource_folder)
 
-                if image is not None:
-                    files[image_name] = image
-                else:
-                    print(f"无法加载图像：{file_path}")
+        for image_file in file_list:
+            ifile = os.path.join(resource_folder, image_file)
+            name = image_file.split('.')[0]
+            bgr = cv2.imread(ifile, cv2.IMREAD_UNCHANGED)
+            files[name] = bgr
 
-        automatic_clicks(times, waiting_time, files)
-
+        automatic(times, waiting_time)
     except ValueError:
         print('输入异常，请重试...')
     except Exception as e:
         print(f"程序遇到错误：{e}")
+    finally:
+        sys.exit()
