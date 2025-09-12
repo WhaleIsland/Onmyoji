@@ -11,8 +11,15 @@ import pyautogui
 
 from PyQt5.QtWidgets import QApplication
 
-SIFT = cv2.SIFT_create()
+# 为4K以下屏幕优化的SIFT参数
+# nfeatures=1500: 适中的特征点数量，避免在低分辨率下特征点过于密集
+# contrastThreshold=0.08: 适中的对比度阈值，减少噪声特征点提高匹配精度
+SIFT = cv2.SIFT_create(nfeatures=1500, contrastThreshold=0.08)
 shell = client.Dispatch('WScript.Shell')
+
+# 初始化QApplication实例（只初始化一次）
+app = QApplication(sys.argv) if QApplication.instance() is None else QApplication.instance()
+screen = QApplication.primaryScreen()
 
 
 def resource_path(relative_path):
@@ -29,9 +36,13 @@ def resource_path(relative_path):
 
 def get_app_shot(hwnd):
     left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-    app = QApplication(sys.argv)
-    screen = QApplication.primaryScreen()
-    image = screen.grabWindow(hwnd).toImage()
+    
+    # 计算实际显示区域
+    display_width = right - left
+    display_height = bottom - top
+    
+    # 使用全局screen对象进行截图，考虑DPI缩放
+    image = screen.grabWindow(0, left, top, display_width, display_height).toImage()
 
     # QImage to numpy array
     width = image.width()
